@@ -9,8 +9,6 @@ const LS_HISTORY_KEY = "aerofetch_history";
 const LS_API_BASE_KEY = "aerofetch_api_base";
 const HISTORY_LIMIT = 6;
 const URL_PATTERN = /https?:\/\/[\w\-._~:/?#[\]@!$&'()*+,;=%]+/i;
-const REQUEST_TIMEOUT_MS = 90000;
-const HEALTH_TIMEOUT_MS = 12000;
 
 // Backend công cộng do tác giả triển khai (Đầy đủ tính năng: Tải qua proxy/ZIP bộ ảnh/Trích xuất âm thanh bằng ffmpeg)
 // Trang lưu trữ tĩnh (GitHub Pages, v.v.) mặc định sử dụng backend này để khách truy cập dùng ngay không cần cấu hình
@@ -101,39 +99,25 @@ const els = {
 
 // ---------------- Hàm tiện ích ----------------
 function apiBase() {
-  let saved = "";
-  try { saved = (localStorage.getItem(LS_API_BASE_KEY) || "").trim().replace(/\/+$/, ""); }
-  catch { /* Storage may be unavailable. */ }
+  const saved = (localStorage.getItem(LS_API_BASE_KEY) || "").replace(/\/+$/, "");
   if (saved) return saved;
-  if (/\.github\.io$/i.test(location.hostname) || location.protocol === "file:") return DEFAULT_REMOTE_API;
+  // Khi chạy local/tự triển khai (cùng nguồn có backend) thì yêu cầu đến site hiện tại; Lưu trữ tĩnh thuần (GitHub Pages, v.v.) mặc định dùng backend công cộng
+  if (/\.github\.io$/i.test(location.hostname) || location.protocol === "file:") {
+    return DEFAULT_REMOTE_API;
+  }
   return "";
-}
-
-function isHttpUrl(value) {
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === "https:" || parsed.protocol === "http:";
-  } catch { return false; }
-}
-
-function safeMediaUrl(value) {
-  return typeof value === "string" && isHttpUrl(value) ? value : "";
-}
-
-function extractUrl(text) {
-  const match = (text || "").match(URL_PATTERN);
-  return match ? match[0].replace(/[.,!?;:，。！？；：)\]]+$/g, "") : null;
-}
-
-function withTimeout(ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return { signal: controller.signal, clear: () => clearTimeout(timer) };
 }
 
 function apiUrl(path, params = {}) {
   const qs = new URLSearchParams(params).toString();
   return `${apiBase()}${path}${qs ? "?" + qs : ""}`;
+}
+
+function extractUrl(text) {
+  const match = (text || "").match(URL_PATTERN);
+  if (!match) return null;
+  try { const url = new URL(match[0]); return ["https:", "http:"].includes(url.protocol) ? url.href : null; }
+  catch { return null; }
 }
 
 function formatCount(n) {
@@ -236,7 +220,7 @@ function normalizeResponse(body) {
         nwm_video_url: vd.nwm_video_url || null,
         wm_video_url: vd.wm_video_url || null,
       },
-      images: images.map(safeMediaUrl).filter(Boolean),
+      images,
       music: {
         title: d.music?.title || "",
         url: firstUrl(d.music?.play_url) || null,
@@ -265,9 +249,8 @@ async function parse(inputText) {
     els.input.focus();
     return;
   }
-  const shareUrl = extractUrl(raw);
-  if (!shareUrl || !isHttpUrl(shareUrl)) {
-    showError("Không tìm thấy liên kết HTTP/HTTPS hợp lệ trong nội dung nhập.");
+  if (!extractUrl(raw)) {
+    showError("Không tìm thấy liên kết hợp lệ trong nội dung nhập, vui lòng kiểm tra và thử lại");
     return;
   }
   if (state.loading) return;
@@ -281,18 +264,16 @@ async function parse(inputText) {
   }, 6000);
   try {
     // minimal=true dành cho node Douyin_TikTok_Download_API trả về cấu trúc rút gọn thống nhất, backend dự án này sẽ bỏ qua
-    const endpoint = apiUrl("/api/hybrid/video_data", { url: shareUrl, minimal: true });
+    const endpoint = apiUrl("/api/hybrid/video_data", { url: raw, minimal: true });
     let body;
     if (apiBase() === PUBLIC_API) {
       body = await fetchPublicNode(endpoint);
     } else {
-      const request = withTimeout(REQUEST_TIMEOUT_MS);
-      try {
-        const resp = await fetch(endpoint, { signal: request.signal, headers: { Accept: "application/json" } });
-        body = await resp.json().catch(() => null);
-        if (!resp.ok) throw new Error(body?.detail || body?.message || `Yêu cầu thất bại (HTTP ${resp.status})`);
-        if (!body) throw new Error("API không trả về JSON hợp lệ.");
-      } finally { request.clear(); }
+      const resp = await fetch(endpoint, { signal: AbortSignal.timeout(90000) });
+      body = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        throw new Error(body?.detail || body?.message || `Yêu cầu thất bại (HTTP ${resp.status})`);
+      }
     }
     if (body && typeof body.code === "number" && body.code !== 200) {
       throw new Error(body.message || body.detail || `Giao diện trả về lỗi (code ${body.code})`);
@@ -306,11 +287,9 @@ async function parse(inputText) {
     renderResult(data);
     saveHistory(raw, data);
   } catch (err) {
-    const message = err?.name === "AbortError"
-      ? "Máy chủ phản hồi quá lâu. Backend có thể đang khởi động; hãy thử lại sau."
-      : err instanceof TypeError
-        ? "Không thể kết nối API. Hãy kiểm tra backend, CORS và API Base URL trong phần Cài đặt."
-        : (err.message || "Đã xảy ra lỗi không xác định.");
+    const message = err instanceof TypeError
+      ? "Không thể kết nối đến API (Backend chưa khởi động, sai địa chỉ hoặc node này chưa mở CORS cross-origin), vui lòng kiểm tra API Base URL trong ⚙ Cài đặt ở góc trên bên phải"
+      : err.message;
     showError(message);
     toast("Phân tích thất bại", "error");
   } finally {
@@ -325,7 +304,7 @@ function renderResult(data) {
 
   // Tác giả và Nền tảng
   const PLATFORM_LABELS = { douyin: "Douyin", tiktok: "TikTok", twitter: "X / Twitter" };
-  els.avatar.src = safeMediaUrl(data.author?.avatar) || "";
+  els.avatar.src = safeMediaUrl(data.author?.avatar || "") || "";
   els.nickname.textContent = data.author?.nickname || "Tác giả không xác định";
   els.uid.textContent = data.author?.unique_id ? "@" + data.author.unique_id : "";
   els.badge.textContent = PLATFORM_LABELS[data.platform] || data.platform;
@@ -351,14 +330,14 @@ function renderResult(data) {
     // Backend dự án này: Xem trước qua proxy để tránh màn hình đen do chống hotlink; Node bên thứ ba: Kết nối trực tiếp đường dẫn không watermark (đã kèm no-referrer)
     els.videoPlayer.src = state.style === "native"
       ? apiUrl("/api/download", { url: state.rawInput, media: "video" })
-      : safeMediaUrl(data.video?.nwm_video_url_HQ || data.video?.nwm_video_url || data.video?.wm_video_url || "");
-    els.videoPlayer.poster = safeMediaUrl(data.cover) || "";
+      : (safeMediaUrl(data.video?.nwm_video_url_HQ || data.video?.nwm_video_url || data.video?.wm_video_url || ""));
+    els.videoPlayer.poster = safeMediaUrl(data.cover || "") || "";
     show(els.videoWrap);
   }
 
   // Nút tải xuống
   const video = data.video || {};
-  const directUrl = safeMediaUrl(video.nwm_video_url_HQ || video.nwm_video_url || video.wm_video_url);
+  const directUrl = video.nwm_video_url_HQ || video.nwm_video_url || video.wm_video_url;
 
   if (isImage) {
     hide(els.btnHd);
@@ -380,11 +359,11 @@ function renderResult(data) {
       els.btnHd.rel = "";
     } else {
       // Node công cộng: Chuyển về link trực tiếp CDN không watermark, noreferrer để tránh lỗi 403 do chống hotlink
-      els.btnHd.href = directUrl || "#";
+      els.btnHd.href = safeMediaUrl(directUrl || "") || "#";
       els.btnHd.target = "_blank";
       els.btnHd.rel = "noreferrer noopener";
     }
-    els.btnDirect.href = directUrl || "#";
+    els.btnDirect.href = safeMediaUrl(directUrl || "") || "#";
     els.btnDirect.setAttribute("aria-disabled", directUrl ? "false" : "true");
   }
 
@@ -408,14 +387,21 @@ function renderResult(data) {
 }
 
 // ---------------- Carousel bộ ảnh ----------------
+function safeMediaUrl(value) {
+  try {
+    const url = new URL(value, location.href);
+    return ["https:", "http:"].includes(url.protocol) ? url.href : "";
+  } catch { return ""; }
+}
+
 function renderCarousel(images) {
   state.slide = 0;
-  const safeImages = (Array.isArray(images) ? images : []).map(safeMediaUrl).filter(Boolean);
-  state.slideCount = safeImages.length;
   els.carouselTrack.replaceChildren();
   els.carouselDots.replaceChildren();
+  const validImages = images.map(safeMediaUrl).filter(Boolean);
+  state.slideCount = validImages.length;
 
-  safeImages.forEach((url, i) => {
+  validImages.forEach((url, i) => {
     const slide = document.createElement("div");
     slide.className = "carousel-slide";
     const image = document.createElement("img");
@@ -428,7 +414,7 @@ function renderCarousel(images) {
     open.href = url;
     open.target = "_blank";
     open.rel = "noreferrer noopener";
-    open.textContent = "Mở trong thẻ mới";
+    open.textContent = "Mở ảnh";
     slide.append(image, open);
     els.carouselTrack.appendChild(slide);
 
@@ -436,10 +422,10 @@ function renderCarousel(images) {
     dot.type = "button";
     dot.className = "carousel-dot";
     dot.setAttribute("aria-label", `Chuyển đến ảnh thứ ${i + 1}`);
-    dot.setAttribute("role", "tab");
     dot.addEventListener("click", () => goToSlide(i));
     els.carouselDots.appendChild(dot);
   });
+  state.slideCount = els.carouselTrack.children.length;
   goToSlide(0);
 }
 
@@ -472,77 +458,56 @@ els.carouselTrack.addEventListener("touchend", (e) => {
 function loadHistory() {
   try {
     const list = JSON.parse(localStorage.getItem(LS_HISTORY_KEY) || "[]");
-    return Array.isArray(list)
-      ? list.filter((item) => item && typeof item.url === "string" && typeof item.time === "number").slice(0, HISTORY_LIMIT)
-      : [];
-  } catch { return []; }
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
 }
 
 function saveHistory(rawInput, data) {
   const entry = {
     url: rawInput,
-    desc: String(data.desc || "Không có mô tả").slice(0, 120),
-    avatar: safeMediaUrl(data.author?.avatar),
-    nickname: String(data.author?.nickname || "").slice(0, 80),
+    desc: (data.desc || "Không có mô tả").slice(0, 60),
+    avatar: data.author?.avatar || "",
+    nickname: data.author?.nickname || "",
     time: Date.now(),
   };
-  const list = [entry, ...loadHistory().filter((item) => item.url !== rawInput)].slice(0, HISTORY_LIMIT);
-  try { localStorage.setItem(LS_HISTORY_KEY, JSON.stringify(list)); }
-  catch { toast("Không thể lưu lịch sử trên thiết bị này", "info"); }
+  // Lọc trùng (Cùng liên kết chỉ giữ lại bản mới nhất), giới hạn số lượng tối đa
+  const list = [entry, ...loadHistory().filter((it) => it.url !== rawInput)]
+    .slice(0, HISTORY_LIMIT);
+  try { localStorage.setItem(LS_HISTORY_KEY, JSON.stringify(list)); } catch { toast("Không thể lưu lịch sử trên thiết bị này", "info"); }
   renderHistory();
 }
 
 function renderHistory() {
   const list = loadHistory();
-  els.historyList.replaceChildren();
   if (!list.length) { hide(els.historySection); return; }
-
+  els.historyList.replaceChildren();
   list.forEach((item) => {
     const li = document.createElement("li");
     li.className = "history-item";
-    li.tabIndex = 0;
-    li.setAttribute("role", "button");
-
     const avatar = document.createElement("img");
     avatar.className = "history-avatar";
     avatar.alt = "";
     avatar.referrerPolicy = "no-referrer";
-    const avatarUrl = safeMediaUrl(item.avatar);
-    if (avatarUrl) avatar.src = avatarUrl;
-    avatar.addEventListener("error", () => { avatar.hidden = true; }, { once: true });
-
-    const meta = document.createElement("div");
-    meta.className = "history-meta";
-    const desc = document.createElement("div");
-    desc.className = "history-desc";
-    desc.textContent = item.desc || "Liên kết đã phân tích";
-    const time = document.createElement("div");
-    time.className = "history-time";
-    time.textContent = `${item.nickname ? item.nickname + " · " : ""}${timeAgo(item.time)}`;
+    avatar.src = safeMediaUrl(item.avatar || "") || "";
+    avatar.addEventListener("error", () => { avatar.style.visibility = "hidden"; }, { once: true });
+    const meta = document.createElement("div"); meta.className = "history-meta";
+    const desc = document.createElement("div"); desc.className = "history-desc"; desc.textContent = item.desc || "Media link";
+    const time = document.createElement("div"); time.className = "history-time"; time.textContent = `${item.nickname ? item.nickname + " · " : ""}${timeAgo(item.time)}`;
     meta.append(desc, time);
-
-    const arrow = document.createElement("span");
-    arrow.className = "history-arrow";
-    arrow.setAttribute("aria-hidden", "true");
-    arrow.textContent = "›";
+    const arrow = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    arrow.setAttribute("viewBox", "0 0 24 24"); arrow.setAttribute("fill", "none"); arrow.setAttribute("stroke", "currentColor"); arrow.setAttribute("stroke-width", "2"); arrow.setAttribute("stroke-linecap", "round"); arrow.setAttribute("stroke-linejoin", "round"); arrow.classList.add("history-arrow");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "polyline"); path.setAttribute("points", "9 18 15 12 9 6"); arrow.appendChild(path);
     li.append(avatar, meta, arrow);
-
-    const open = () => {
-      els.input.value = item.url;
-      parse(item.url);
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    };
-    li.addEventListener("click", open);
-    li.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
-    });
+    li.addEventListener("click", () => { els.input.value = item.url; parse(item.url); window.scrollTo({ top: 0, behavior: "smooth" }); });
     els.historyList.appendChild(li);
   });
   show(els.historySection);
 }
 
 els.clearHistoryBtn.addEventListener("click", () => {
-  try { localStorage.removeItem(LS_HISTORY_KEY); } catch { /* ignore */ }
+  try { localStorage.removeItem(LS_HISTORY_KEY); } catch {}
   renderHistory();
   toast("Đã xóa lịch sử", "success");
 });
@@ -567,46 +532,37 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeDrawer();
 });
 
-function normalizeApiBase(value) {
-  const trimmed = String(value || "").trim().replace(/\/+$/, "");
-  if (!trimmed) return "";
-  let parsed;
-  try { parsed = new URL(trimmed); } catch { throw new Error("API Base URL không hợp lệ."); }
-  if (!["https:", "http:"].includes(parsed.protocol)) throw new Error("Chỉ chấp nhận URL HTTP/HTTPS.");
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error("API Base URL không được chứa thông tin đăng nhập, query hoặc hash.");
+els.testApiBtn.addEventListener("click", async () => {
+  const value = els.apiBaseInput.value.trim().replace(/\/+$/, "");
+  const base = value || apiBase();
+  if (!base) { toast("Hãy nhập API Base URL trước", "error"); return; }
+  try {
+    const url = new URL(base);
+    if (url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") throw new Error("URL không an toàn");
+    const resp = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(12000) });
+    const body = await resp.json();
+    if (resp.ok && body?.status === "ok") toast("Kết nối API thành công", "success");
+    else throw new Error();
+  } catch {
+    toast("Không thể kết nối. Kiểm tra URL, HTTPS, CORS và endpoint /api/health", "error", 4200);
   }
-  return parsed.origin + parsed.pathname.replace(/\/+$/, "");
-}
+});
 
 els.saveSettingsBtn.addEventListener("click", () => {
-  try {
-    const value = normalizeApiBase(els.apiBaseInput.value);
-    if (value) localStorage.setItem(LS_API_BASE_KEY, value);
-    else localStorage.removeItem(LS_API_BASE_KEY);
-    toast("Đã lưu cấu hình API", "success");
-    closeDrawer();
-  } catch (error) { toast(error.message || "Không thể lưu cấu hình", "error"); }
+  const raw = els.apiBaseInput.value.trim().replace(/\/+$/, "");
+  if (raw) {
+    try {
+      const parsed = new URL(raw);
+      if (!['https:', 'http:'].includes(parsed.protocol) || (parsed.protocol === 'http:' && !['localhost','127.0.0.1'].includes(parsed.hostname))) throw new Error();
+      localStorage.setItem(LS_API_BASE_KEY, parsed.origin);
+    } catch { toast("API Base URL không hợp lệ. Hãy nhập địa chỉ HTTPS", "error"); return; }
+  } else localStorage.removeItem(LS_API_BASE_KEY);
+  toast("Đã lưu cấu hình API", "success");
+  closeDrawer();
 });
 
-els.testApiBtn.addEventListener("click", async () => {
-  let value;
-  try { value = normalizeApiBase(els.apiBaseInput.value) || apiBase() || location.origin; }
-  catch (error) { toast(error.message, "error"); return; }
-  const request = withTimeout(HEALTH_TIMEOUT_MS);
-  els.testApiBtn.disabled = true;
-  try {
-    const resp = await fetch(`${value}/api/health`, { signal: request.signal, headers: { Accept: "application/json" } });
-    const body = await resp.json().catch(() => null);
-    if (resp.ok && body?.status === "ok") toast("Kết nối API bình thường ✓", "success");
-    else throw new Error(body?.detail || `API phản hồi không hợp lệ (HTTP ${resp.status})`);
-  } catch (error) {
-    toast(error.name === "AbortError" ? "Kiểm tra API quá thời gian" : (error.message || "Không thể kết nối API"), "error");
-  } finally {
-    request.clear();
-    els.testApiBtn.disabled = false;
-  }
-});
+// Khôi phục cấu hình API đã lưu trên thiết bị
+els.apiBaseInput.value = localStorage.getItem(LS_API_BASE_KEY) || "";
 
 // ---------------- Tương tác khu vực nhập ----------------
 els.parseBtn.addEventListener("click", () => parse());
@@ -632,5 +588,4 @@ els.pasteBtn.addEventListener("click", async () => {
 });
 
 // ---------------- Khởi tạo ----------------
-try { els.apiBaseInput.value = localStorage.getItem(LS_API_BASE_KEY) || ""; } catch { /* storage unavailable */ }
 renderHistory();
